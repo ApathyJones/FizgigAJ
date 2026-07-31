@@ -5,9 +5,10 @@ if `available_optimizers()` lists it, a real parameter must survive a real step.
 free-form module path and the fallback, since both are user-reachable through the GUI's Optimizer
 Type field.
 """
+import os
 import sys
 
-sys.path.insert(0, r"W:\Peter\Documents\Development\Fizgig\src")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import torch
 import torch.nn as nn
 

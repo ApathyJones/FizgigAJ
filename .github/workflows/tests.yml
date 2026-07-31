@@ -1,0 +1,79 @@
+# Runs the test suite on every push and PR.
+#
+# windows-latest, not ubuntu: most of the suite drives a real Tk window (walking the widget
+# tree, invoking buttons, reading colours), Windows runners ship Tk working out of the box,
+# and Windows is the platform Fizgig is actually used on. A Linux job would additionally need
+# xvfb for every GUI test.
+#
+# CPU torch, not the cu128 pin from requirements.txt: the CUDA wheel is several GB and GitHub's
+# hosted runners have no GPU, so the tests that need one are excluded below rather than run and
+# failed. Installing torch FIRST from the CPU index means the later installs see 2.10.0 already
+# satisfied and won't drag the CUDA build in behind it.
+name: Tests
+
+on:
+  push:
+    branches: ["master"]
+    paths-ignore: ["**.md", "docs/**", "assets/**"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "assets/**"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install CPU torch
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch==2.10.0
+
+      # Pinned to match requirements.txt. Deliberately NOT `-r requirements.txt`: that pulls
+      # bitsandbytes, insightface, onnxruntime and the CUDA index, none of which a CPU runner
+      # can use. This is the minimum set under which the 15 tests below pass — verified by
+      # bisecting a clean venv, not guessed.
+      - name: Install test dependencies
+        run: >
+          pip install
+          pillow==11.3.0 tqdm==4.67.1 "numpy>=1.26.4,<3" safetensors==0.5.3
+          accelerate==1.6.0 toml==0.10.2 voluptuous==0.15.2 einops==0.7.0
+          huggingface-hub==0.34.3 packaging==25.0 psutil pyyaml==6.0.3
+          opencv-python==4.10.0.84 transformers==4.57.6 tokenizers==0.22.2
+          sentencepiece==0.2.1
+
+      # FIZGIG_NO_PERSIST stops the GUI's traced vars from writing prefs.json / last_used.json.
+      # PYTHONIOENCODING because the tests print live widget labels containing UI glyphs and the
+      # Windows console default (cp1252) raises on them.
+      - name: Run tests
+        shell: bash
+        env:
+          FIZGIG_NO_PERSIST: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: |
+          # Excluded — these need a real GPU and fail on a CPU runner for reasons that are not
+          # regressions. Run them locally before a release:
+          #   test_int8_train.py       "Torch not compiled with CUDA enabled"
+          #   test_nvfp4_accuracy.py   same; also needs bitsandbytes
+          #   test_optimizers.py       needs bitsandbytes (CUDA build)
+          #   test_compile_res_aware.py  asserts on the compile heuristic's GPU probe
+          gpu_only="test_int8_train.py test_nvfp4_accuracy.py test_optimizers.py \
+                    test_compile_res_aware.py"
+          failed=""
+          for t in tests/test_*.py; do
+            name=$(basename "$t")
+            case " $gpu_only " in *" $name "*) echo "SKIP  $name (needs GPU)"; continue;; esac
+            if python "$t" > "out.txt" 2>&1; then
+              echo "PASS  $name"
+            else
+              echo "FAIL  $name"; cat "out.txt"; failed="$failed $name"
+            fi
+          done
+          if [ -n "$failed" ]; then echo; echo "FAILED:$failed"; exit 1; fi
+          echo; echo "All CPU-runnable tests passed."

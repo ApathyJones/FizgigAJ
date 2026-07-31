@@ -6,17 +6,25 @@ import sys
 import tempfile
 
 os.environ["FIZGIG_NO_PERSIST"] = "1"
-REPO = r"W:/Peter/Documents/Development/Fizgig"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "src"))
 
 import tkinter as tk
 import lora_trainer_gui as G
+
+# These tests print live widget labels, which carry UI glyphs (✨, ▶). Windows
+# stdout defaults to cp1252 and raises UnicodeEncodeError on them, so a passing
+# assertion could kill the run while merely REPORTING itself.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 from fizgig.krea2.embedder import (CAPTION_TASKS, DEFAULT_CAPTION_TASK,
                                    ENCODE_SYSTEM_DESCRIPTOR, CAPTION_INSTRUCTION,
                                    SUBJECT_RULE, _strip_caption_preamble)
 
-G.LAST_USED_FILE = os.path.join(os.environ["TEMP"], "nope", ".last_used.json")
+G.LAST_USED_FILE = os.path.join(tempfile.gettempdir(), "nope", ".last_used.json")
 
 fails = []
 
@@ -339,7 +347,7 @@ ck("  and unloads normally once it has stopped", g.qwen_captioner is None)
 # (b) Caption All was never disabled, so a second click started a SECOND worker over the same
 #     files — doubled work and doubled log lines, i.e. "did I queue a job up?"
 g.get_caption_image_files = lambda: ["a.png"]
-g.image_folder_var.set(os.environ["TEMP"])
+g.image_folder_var.set(tempfile.gettempdir())
 _started = []
 _real_thread = G.threading.Thread
 G.threading.Thread = lambda *a, **k: _started.append(1) or _types.SimpleNamespace(

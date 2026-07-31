@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 os.environ["FIZGIG_NO_PERSIST"] = "1"
-REPO = r"W:/Peter/Documents/Development/Fizgig"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "src"))
 
@@ -21,7 +21,7 @@ import tkinter as tk
 from PIL import Image
 import lora_trainer_gui as G
 
-G.LAST_USED_FILE = os.path.join(os.environ["TEMP"], "nope", ".last_used.json")
+G.LAST_USED_FILE = os.path.join(tempfile.gettempdir(), "nope", ".last_used.json")
 
 fails = []
 
@@ -52,6 +52,14 @@ ck("  escaped glob finds all 3",
 
 # --- 2. the dataset loader ----------------------------------------------------------------
 from fizgig.dataset.image_dataset import glob_images
+
+# These tests print live widget labels, which carry UI glyphs (✨, ▶). Windows
+# stdout defaults to cp1252 and raises UnicodeEncodeError on them, so a passing
+# assertion could kill the run while merely REPORTING itself.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 for _f in FOLDERS:
     d = os.path.join(BASE, _f)

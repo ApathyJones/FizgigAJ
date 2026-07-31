@@ -9,9 +9,10 @@ NVFP4 format (Blackwell):
   values  float4_e2m1fn_x2  — e2m1, two packed per byte
   scales  float8_e4m3fn     — one per 16 elements along K, laid out per _scaled_mm's requirement
 """
+import os
 import sys
 
-sys.path.insert(0, r"W:\Peter\Documents\Development\Fizgig\src")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import torch
 
 DEV = "cuda"

@@ -5,10 +5,11 @@ Checks against a bf16 reference at Krea 2's real shape:
   2. GRADIENT error — the thing that decides whether a LoRA trains properly
   3. speed of forward, and of forward+backward
 """
+import os
 import sys
 import time
 
-sys.path.insert(0, r"W:\Peter\Documents\Development\Fizgig\src")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import torch
 import torch.nn as nn
 

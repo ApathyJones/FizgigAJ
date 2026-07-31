@@ -25,7 +25,7 @@ import tempfile
 import textwrap
 import time
 
-REPO = r"W:/Peter/Documents/Development/Fizgig"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = os.path.join(REPO, "venv", "Scripts", "python.exe")
 PYW = os.path.join(REPO, "venv", "Scripts", "pythonw.exe")
 

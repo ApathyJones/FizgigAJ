@@ -12,11 +12,19 @@ import tkinter as tk
 import webbrowser
 
 os.environ["FIZGIG_NO_PERSIST"] = "1"          # traced vars auto-save; never touch real prefs
-REPO = r"W:/Peter/Documents/Development/Fizgig"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "src"))
 os.chdir(REPO)
 from lora_trainer_gui import LoRATrainerGUI      # noqa: E402
+
+# This test prints live widget labels, which carry UI glyphs (✨, ▶). Windows
+# stdout defaults to cp1252 and raises UnicodeEncodeError on them, so a passing
+# assertion could kill the run while merely REPORTING itself.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 opened = []
 webbrowser.open = lambda u, *a, **k: opened.append(u)

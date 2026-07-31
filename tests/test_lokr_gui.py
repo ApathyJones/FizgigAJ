@@ -4,18 +4,27 @@ Covers the Phase 3 wiring: the Network Type control exists only under Krea 2, Lo
 rank/alpha rows for the Factor dial, the command builder emits the flags, and both keys ride
 the preset/persistence sweep.
 """
+import tempfile
 import os
 import sys
 
 os.environ["FIZGIG_NO_PERSIST"] = "1"
-REPO = r"W:/Peter/Documents/Development/Fizgig"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "src"))
 
 import tkinter as tk  # noqa: E402
 import lora_trainer_gui as G  # noqa: E402
 
-G.LAST_USED_FILE = os.path.join(os.environ["TEMP"], "nope", ".last_used.json")
+# These tests print live widget labels, which carry UI glyphs (✨, ▶). Windows
+# stdout defaults to cp1252 and raises UnicodeEncodeError on them, so a passing
+# assertion could kill the run while merely REPORTING itself.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+G.LAST_USED_FILE = os.path.join(tempfile.gettempdir(), "nope", ".last_used.json")
 
 fails = []
 

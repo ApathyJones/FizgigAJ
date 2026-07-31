@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, Menu, scrolledtext, simpledialog
+import io
 import subprocess
 import sys
 import threading
@@ -11,8 +12,7 @@ import re
 import webbrowser
 import glob
 import time
-import socket
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from PIL import Image, ImageTk
 
 # CUDA allocator policy, set before ANYTHING imports torch — the backend is fixed at CUDA init,
@@ -542,6 +542,23 @@ OUTPUT_LORAS_DIR = os.path.join(os.path.dirname(__file__), "output_loras")
 LAST_USED_FILE = os.path.join(os.path.dirname(__file__), ".last_used.json")
 
 
+def _warn(context: str, exc: BaseException) -> None:
+    """Report a swallowed failure without interrupting the user.
+
+    Writes to stderr, which the GUI rebinds to _GUIWriter — so this lands in the console log
+    the user can already open, and in the terminal when running headless.
+
+    For failures it is safe to CONTINUE past but not safe to hide. The settings writers below
+    are the motivating case: they are the only record of every model path, their readers fall
+    back to defaults on a bad file, and a silent write failure (disk full, permissions, the
+    folder on a disconnected drive) presents to the user as "the app forgot my paths" with
+    nothing anywhere to say why."""
+    try:
+        print(f"[fizgig] {context}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def load_last_used():
     """Load last-used folder paths from config file"""
     defaults = {
@@ -581,8 +598,8 @@ def save_last_used(data):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, LAST_USED_FILE)
-    except Exception:
-        pass
+    except Exception as e:
+        _warn(f"could not save {os.path.basename(LAST_USED_FILE)}", e)
 
 
 # ---------------------------------------------------------------------------
@@ -834,8 +851,8 @@ def save_prefs(prefs: dict) -> None:
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(to_save, f, indent=2)
         os.replace(tmp, PREFS_FILE)
-    except Exception:
-        pass
+    except Exception as e:
+        _warn(f"could not save {os.path.basename(PREFS_FILE)}", e)
 
 
 # Maps Training tab settings keys to prefs keys — entries with matching keys
@@ -1274,7 +1291,47 @@ class LoRATrainerGUI:
 
     # ── Global log + status indicator ───────────────────────────────────
 
-    def _append_global_log(self, text):
+    # Console ceiling. A run streams for hours and nothing ever cleared these widgets mid-run,
+    # so the Text grew without bound and every insert/see() got slower with it. Trim in blocks
+    # (5000 -> 4000) so the cost is amortised over a thousand lines instead of paid on each one.
+    _CONSOLE_MAX_LINES = 5000
+    _CONSOLE_TRIM_TO = 4000
+
+    def _stream_into_text(self, widget, text, transient, flag_attr):
+        """Append `text` to a console Text widget, letting \\r updates overwrite in place.
+
+        tqdm rewrites ONE logical line by prefixing '\\r'. The pipes are read with newline=''
+        so that terminator survives (see run_subprocess), and each refresh deletes the previous
+        transient line before landing. Without this, every progress refresh was appended as its
+        own line — a 4-hour run left ~30k near-identical rows in the widget and the console
+        became the slowest thing in the app.
+
+        `flag_attr` names the per-widget attribute remembering whether the last write was
+        transient; each console (main + popup) needs its own, since the popup can open midway
+        through a run and must not delete a line it never wrote."""
+        try:
+            at_bottom = widget.yview()[1] >= 0.999
+        except Exception:
+            at_bottom = True
+        try:
+            widget.configure(state="normal")
+            if getattr(self, flag_attr, False):
+                # Drop the transient line sitting on the last row. Tk keeps an implicit final
+                # newline, so "end-1c linestart" is the start of that row and "end-1c" its end.
+                widget.delete("end-1c linestart", "end-1c")
+            widget.insert(tk.END, text)
+            if not transient:
+                n = int(widget.index("end-1c").split(".")[0])
+                if n > self._CONSOLE_MAX_LINES:
+                    widget.delete("1.0", f"{n - self._CONSOLE_TRIM_TO}.0")
+            if at_bottom:
+                widget.see(tk.END)
+            widget.configure(state="disabled")
+        except Exception:
+            pass
+        setattr(self, flag_attr, transient)
+
+    def _append_global_log(self, text, transient=False):
         """Append text to the global log buffer and push to popup if open.
 
         Thread-safe by marshalling: several workers (profiler, extract, engine loads) log
@@ -1284,21 +1341,20 @@ class LoRATrainerGUI:
         the popup opened as the load returned, and the next worker log write hit it."""
         import threading
         if threading.current_thread() is not threading.main_thread():
-            self.master.after(0, self._append_global_log, text)
+            self.master.after(0, self._append_global_log, text, transient)
             return
-        self._log_buffer.append(text)
+        # A transient (progress) line supersedes the previous one rather than stacking, so the
+        # buffer holds one live progress entry instead of thousands of dead ones.
+        if getattr(self, "_log_buf_transient", False) and self._log_buffer:
+            self._log_buffer[-1] = text
+        else:
+            self._log_buffer.append(text)
+        self._log_buf_transient = transient
         if len(self._log_buffer) > 50000:
             self._log_buffer = self._log_buffer[-40000:]
         if self._console_popup_text is not None:
-            try:
-                at_bottom = self._console_popup_text.yview()[1] >= 0.999
-                self._console_popup_text.configure(state="normal")
-                self._console_popup_text.insert(tk.END, text)
-                if at_bottom:
-                    self._console_popup_text.see(tk.END)
-                self._console_popup_text.configure(state="disabled")
-            except Exception:
-                pass
+            self._stream_into_text(self._console_popup_text, text, transient,
+                                   "_popup_transient")
 
     def _royale_is_busy(self):
         """True while any LoRA Royale work is in flight (epoch render / seed / prompt /
@@ -1430,6 +1486,10 @@ class LoRATrainerGUI:
 
         self._console_popup = win
         self._console_popup_text = text
+        # Inherit the buffer's transient state: if the replayed history ends on a live progress
+        # line, the popup's first write must OVERWRITE that row rather than append below it —
+        # otherwise opening the popup mid-run strands a dead progress bar in the scrollback.
+        self._popup_transient = getattr(self, "_log_buf_transient", False)
 
         def _on_close():
             self._console_popup = None
@@ -1851,28 +1911,39 @@ class LoRATrainerGUI:
         return f"#{r:02x}{g:02x}{b:02x}"
 
     def _draw_status_segment(self, canvas, used, total, peak, label, c_start, c_end):
-        canvas.delete("all")
         try:
             w = int(canvas["width"]); h = int(canvas["height"])
         except Exception:
             return
         frac = max(0.0, min(1.0, used / total)) if total else 0.0
+        fill_w = int(w * frac)
+        px = int(w * max(0.0, min(1.0, peak / total))) if (peak and total) else None
+        text = (f"{label}  {used/1073741824:.1f} / {total/1073741824:.1f} GB"
+                f" · peak {peak/1073741824:.1f}")  # GiB (binary) — matches '32 GB' labels
+
+        # Redraw only when the PICTURE changes, not when the numbers do. This poll fires every
+        # second for the life of the process, and the gradient below is ~w/3 separate canvas
+        # items — so an idle app rebuilt a few hundred items per second, forever, to produce a
+        # pixel-identical result. The signature is everything actually drawn: geometry, the
+        # fill in whole pixels, the peak tick, and the label at its displayed precision.
+        sig = (w, h, fill_w, px, text)
+        if getattr(canvas, "_fizgig_sig", None) == sig:
+            return
+        canvas._fizgig_sig = sig
+
+        canvas.delete("all")
         # track
         canvas.create_rectangle(0, 0, w, h, fill=COLORS["bg_deep"], outline="")
         # gradient fill: colour interpolates c_start -> c_end across the FULL
         # width, drawn up to the current fill (fuller = closer to c_end).
-        fill_w = int(w * frac)
         step = 3
         for x in range(0, fill_w, step):
             col = self._lerp_color(c_start, c_end, x / max(1, w - 1))
             canvas.create_rectangle(x, 1, min(x + step, fill_w), h - 1, fill=col, outline="")
         # per-run peak tick
-        if peak and total:
-            px = int(w * max(0.0, min(1.0, peak / total)))
+        if px is not None:
             canvas.create_line(px, 0, px, h, fill="#FFFFFF", width=2)
-        canvas.create_text(10, h // 2,
-                           text=(f"{label}  {used/1073741824:.1f} / {total/1073741824:.1f} GB"
-                                 f" · peak {peak/1073741824:.1f}"),  # GiB (binary) — matches '32 GB' labels
+        canvas.create_text(10, h // 2, text=text,
                            anchor="w", fill="#FFFFFF", font=(FONT_FAMILY, 9, "bold"))
 
     def _poll_status_bar(self):
@@ -6567,6 +6638,16 @@ class LoRATrainerGUI:
                 max_new_tokens=max_tokens,
                 do_sample=False,
                 num_beams=3,
+                # use_cache=False is REQUIRED, not a leftover. Florence-2's vendored
+                # modeling_florence2.py reads the KV cache as a legacy tuple-of-tuples
+                # (past_key_values[0][0].shape[2]); transformers 4.5x hands it a Cache object,
+                # so use_cache=True dies with "'NoneType' object has no attribute 'shape'" on
+                # the first decode step — measured on 4.57.6, at every beam count. Same family
+                # as the _supports_sdpa clash worked around at load time above.
+                #
+                # It costs less than it looks: a caption is ~0.2 s on a 4090, so a 200-image
+                # dataset is well under a minute. num_beams=1 saves only ~15% and visibly
+                # degrades the text (repetition), so the beams stay too.
                 use_cache=False
             )
 
@@ -7702,14 +7783,6 @@ class LoRATrainerGUI:
         # Fallback to local samples folder
         return os.path.join(os.path.dirname(__file__), "output_loras", "sample")
 
-    def find_free_port(self):
-        """Find an available port for the HTTP server"""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0))
-            s.listen(1)
-            port = s.getsockname()[1]
-        return port
-
     def start_gallery_server(self):
         """Start HTTP server to serve samples directory (avoids CORS issues)"""
         if self.gallery_server is not None:
@@ -7720,8 +7793,11 @@ class LoRATrainerGUI:
         # LoRA checkpoints live in the output dir (parent of sample/); serve them via /loras/.
         output_dir = self.settings.get("LORA_OUTPUT_DIR", "") or os.path.dirname(samples_dir)
 
-        # Find free port
-        self.gallery_server_port = self.find_free_port()
+        # Port is chosen by the bind below (port 0) and read back from the socket. The old
+        # find_free_port() probed with a throwaway socket, closed it, then bound the real
+        # server to the number it saw — a window in which anything could take the port, and
+        # the probe bound '' (every interface) to pick a port the server then used only on
+        # loopback.
 
         # Create handler that serves images from samples/ and checkpoints from /loras/ (output dir).
         app = self   # for the likeness endpoints (never touch Tk vars from handler threads)
@@ -7768,13 +7844,18 @@ class LoRATrainerGUI:
                 pass  # Suppress logging
 
         try:
-            self.gallery_server = HTTPServer(('127.0.0.1', self.gallery_server_port), SamplesHandler)
+            # ThreadingHTTPServer, not HTTPServer: the base class handles ONE request at a time,
+            # so a gallery page with a few dozen sample PNGs fetched them strictly in series,
+            # and the /set_baselines POST — which kicks off CPU likeness scoring — blocked every
+            # image load for as long as it ran. daemon_threads so a pending handler can never
+            # keep the app alive at exit.
+            server = ThreadingHTTPServer(('127.0.0.1', 0), SamplesHandler)
+            server.daemon_threads = True
+            self.gallery_server = server
+            self.gallery_server_port = server.server_address[1]   # the port the OS actually gave us
 
-            # Run server in background thread
-            def serve_forever():
-                self.gallery_server.serve_forever()
-
-            self.gallery_server_thread = threading.Thread(target=serve_forever, daemon=True)
+            self.gallery_server_thread = threading.Thread(
+                target=server.serve_forever, daemon=True)
             self.gallery_server_thread.start()
 
         except Exception as e:
@@ -7783,11 +7864,24 @@ class LoRATrainerGUI:
             self.gallery_server_port = None
 
     def stop_gallery_server(self):
-        """Stop the HTTP server"""
-        if self.gallery_server is not None:
-            self.gallery_server.shutdown()
-            self.gallery_server = None
-            self.gallery_server_port = None
+        """Stop the HTTP server and release its socket."""
+        server = self.gallery_server
+        if server is None:
+            return
+        self.gallery_server = None
+        self.gallery_server_port = None
+        try:
+            server.shutdown()        # stops serve_forever; does NOT close the listening socket
+            # server_close() is the half that was missing: without it the listener stayed open
+            # and its port held, leaking a file descriptor on every start/stop — i.e. once per
+            # training run, since the gallery restarts with each one.
+            server.server_close()
+        except Exception:
+            pass
+        t = self.gallery_server_thread
+        self.gallery_server_thread = None
+        if t is not None:
+            t.join(timeout=2)        # bounded: shutdown() has already told the loop to exit
 
     def open_samples_gallery(self):
         """Open the samples gallery HTML viewer in browser via HTTP server"""
@@ -18548,16 +18642,32 @@ class LoRATrainerGUI:
         """Update training console — only auto-scroll if user was already at the bottom.
         Uses the widget's own yview() position as the authoritative signal; the older
         self.user_scrolled flag sometimes got out of sync with actual widget state."""
-        self._append_global_log(line)
-        try:
-            at_bottom = self.console_output.yview()[1] >= 0.999
-        except Exception:
-            at_bottom = True
-        self.console_output.configure(state="normal")
-        self.console_output.insert(tk.END, line)
-        if at_bottom:
-            self.console_output.see(tk.END)
-        self.console_output.configure(state="disabled")
+        # Classify the terminator BEFORE anything else. '\n' means "this line is final";
+        # '\r' means "rewrite this same line" (tqdm). run_subprocess reads with newline='' so
+        # the distinction survives the pipe — under universal-newline translation every
+        # progress refresh looked like a finished line and got appended, thousands per run.
+        #
+        # Unterminated is treated as transient: every one of the app's own update_console
+        # callers ends in '\n', so a chunk without one can only be a partial read from a pipe.
+        if line.endswith("\r\n"):
+            body, transient = line[:-2], False
+        elif line.endswith("\n"):
+            body, transient = line[:-1], False
+        elif line.endswith("\r"):
+            body, transient = line[:-1], True
+        else:
+            body, transient = line, True
+
+        # '\r' mid-chunk is a carriage return in the terminal sense — the cursor goes back to
+        # column 0 and what follows overwrites. Only the text after the LAST one is visible, so
+        # collapse rather than rendering a literal control character. tqdm prefixes its bar with
+        # '\r', which makes a leading one the common case.
+        if "\r" in body:
+            body = body.rsplit("\r", 1)[1]
+
+        line = body if transient else body + "\n"
+        self._append_global_log(line, transient=transient)
+        self._stream_into_text(self.console_output, line, transient, "_console_transient")
 
         # Detect CUDA OOM. A Krea 2 training-step OOM is best fixed by the 4-bit (NF4) base (it
         # frees far more than swap); otherwise suggest more block swap. (Preview OOMs are caught in
@@ -18848,35 +18958,81 @@ class LoRATrainerGUI:
             # and costs training ~1% — it only yields when something else actually wants time.
             creationflags = (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
                              | subprocess.BELOW_NORMAL_PRIORITY_CLASS)
-            preexec_fn = None
+            new_session = False
         else:
             creationflags = 0
-            preexec_fn = os.setsid
+            # start_new_session, NOT preexec_fn=os.setsid: they do the same thing (setsid in the
+            # child, so stop_training's killpg reaches the whole tree), but preexec_fn runs
+            # PYTHON code between fork() and exec() — and this process holds ~30 threads. A fork
+            # only clones the calling thread, so any lock another thread happened to hold is
+            # frozen held in the child, and the callback can deadlock before exec ever runs.
+            # CPython documents preexec_fn as unsafe with threads for exactly this reason;
+            # start_new_session is the same call made in C after fork, touching no locks.
+            new_session = True
 
+        # Binary pipes, decoded here rather than by Popen's text=True. Universal-newline
+        # translation rewrites '\r' to '\n', which turned every tqdm progress refresh into what
+        # looked like a finished line — the console appended thousands of them per run. Reading
+        # binary and wrapping with newline='' keeps the terminator intact so update_console can
+        # tell "rewrite this line" from "this line is done".
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-            encoding='utf-8',
             env=env,
             creationflags=creationflags,
-            preexec_fn=preexec_fn
+            start_new_session=new_session,
         )
         self.current_process = process
         if os.name == 'nt':
             self.process_group_id = process.pid
 
+        # One Tk callback per BATCH of lines rather than one per line. Each update_console does
+        # a yview(), an insert, a see() and two configure()s; latent caching over a few hundred
+        # images emits output in bursts that used to queue thousands of separate after(0)
+        # callbacks, and the window sat unresponsive while Tk drained them one at a time.
+        # 50 ms is below the threshold where the console reads as anything but live.
+        self._console_pending = []
+        self._console_drain_scheduled = False
+        if not hasattr(self, "_console_lock"):
+            self._console_lock = threading.Lock()
+
+        def drain_console():
+            with self._console_lock:
+                batch = self._console_pending
+                self._console_pending = []
+                self._console_drain_scheduled = False
+            for text in batch:
+                self.update_console(text)
+
+        def queue_console(text):
+            """Hand a line to the Tk thread. Safe from the reader threads."""
+            with self._console_lock:
+                self._console_pending.append(text)
+                if self._console_drain_scheduled:
+                    return          # a drain is already coming; it will pick this up
+                self._console_drain_scheduled = True
+            try:
+                self.master.after(50, drain_console)
+            except Exception:
+                pass                # window already gone
+
         def read_output(pipe, output_type):
-            """Read subprocess output line by line"""
-            while True:
-                line = pipe.readline()
-                if not line:
-                    break
-                self.master.after(0, self.update_console, line)
-            pipe.close()
+            """Read subprocess output line by line, preserving '\\r' line terminators."""
+            # errors='replace': a mid-run decode error must never kill the reader thread and
+            # silently strand the console while training carries on.
+            stream = io.TextIOWrapper(pipe, encoding='utf-8', errors='replace', newline='')
+            try:
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        break
+                    queue_console(line)
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
         threading.Thread(target=read_output, args=(process.stdout, "STDOUT"), daemon=True).start()
         threading.Thread(target=read_output, args=(process.stderr, "STDERR"), daemon=True).start()
@@ -18884,13 +19040,17 @@ class LoRATrainerGUI:
         def check_process():
             """Check subprocess completion"""
             process.wait()
-            self.master.after(0, self.update_console, f"{name} process completed.\n")
+            # Through queue_console, not a direct after(0): console text has to stay in order
+            # with the reader threads' output, and an after(0) jumps ahead of the batch drain
+            # scheduled at +50 ms — which printed "process completed" ABOVE the run's own last
+            # lines. Control-flow callbacks below stay on after(0); only text is sequenced.
+            queue_console(f"{name} process completed.\n")
             self.current_process = None
             # Route training-subprocess exit through the pause/resume state machine
             if name and "training" in name.lower():
                 self.master.after(0, self._on_training_subprocess_exited, process.returncode)
             if process.returncode != 0:
-                self.master.after(0, self.update_console,
+                queue_console(
                     f"ERROR: {name} failed with exit code {process.returncode}. Pipeline stopped.\n")
                 self.master.after(0, self.stop_samples_watcher)
                 return
@@ -20254,7 +20414,10 @@ class LoRATrainerGUI:
             ):
                 return
             try:
-                self.stop_training()
+                # wait=True: we are about to destroy() and exit, so the kill has to complete
+                # here. The default (threaded) form would return immediately and the process
+                # would outlive the window — the exact orphaning this handler exists to prevent.
+                self.stop_training(wait=True)
             except Exception:
                 pass
         # Final settings snapshot — some fields only persist via debounced traces or other
@@ -20268,39 +20431,81 @@ class LoRATrainerGUI:
         except Exception:
             pass
 
-    def stop_training(self):
-        """Stop the current running process"""
-        # Stop samples watcher
+    def _console_from_thread(self, text):
+        """update_console from a worker thread, tolerating a window that is already gone.
+
+        The stop path runs while the app may be shutting down, and after() on a destroyed
+        interpreter raises — which would otherwise kill the thread mid-teardown."""
+        try:
+            self.master.after(0, self.update_console, text)
+        except Exception:
+            pass
+
+    def _terminate_training_process(self, proc):
+        """Kill `proc` and its whole tree, then reap it. BLOCKS for up to ~10 s."""
+        try:
+            if os.name == 'nt':
+                # CREATE_NO_WINDOW prevents CTRL_BREAK_EVENT from working,
+                # so terminate the process tree via taskkill instead.
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception as e:
+            self._console_from_thread("Error stopping process: " + str(e) + "\n")
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                # Bounded, unlike the bare wait() this replaces: an unkillable child (a wedged
+                # CUDA driver call is the realistic case) hung that call forever, and on the
+                # app-close path that meant a window that never went away.
+                proc.wait(timeout=5)
+            except Exception as e:
+                self._console_from_thread("Error killing process: " + str(e) + "\n")
+        except Exception:
+            pass
+
+    def stop_training(self, wait=False):
+        """Stop the current running process.
+
+        Off the Tk thread by default. Tearing down a training tree holding 14+ GB of VRAM
+        takes seconds, and doing that inline froze the window — Windows greys it out as "not
+        responding" — at exactly the moment the user is anxious about whether Stop worked.
+
+        `wait=True` blocks until the child is reaped, and is for the app-close path only:
+        there the window is about to be destroyed, and returning early would orphan the run."""
         self.stop_samples_watcher()
 
-        if self.current_process and self.current_process.poll() is None:
-            try:
-                if os.name == 'nt':
-                    # CREATE_NO_WINDOW prevents CTRL_BREAK_EVENT from working,
-                    # so terminate the process tree via taskkill instead.
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(self.current_process.pid)],
-                        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
-                    )
-                else:
-                    os.killpg(os.getpgid(self.current_process.pid), signal.SIGTERM)
-            except Exception as e:
-                self.update_console("Error stopping process: " + str(e) + "\n")
-            try:
-                self.current_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    self.current_process.kill()
-                    self.current_process.wait()
-                except Exception as e:
-                    self.update_console("Error killing process: " + str(e) + "\n")
-            self.current_process = None
-            if self.training_thread:
-                self.training_thread.join(timeout=1)
-                self.training_thread = None
-            self.update_console("Training stopped\n")
-        else:
+        proc = self.current_process
+        if proc is None or proc.poll() is not None:
             self.update_console("No active process to stop\n")
+            return
+        # Re-entrancy guard: Stop stays enabled while the kill is in flight, so without this a
+        # second click starts a second taskkill against the same (possibly already reaped) pid.
+        if getattr(self, "_stop_in_flight", False):
+            return
+        self._stop_in_flight = True
+        self.update_console("Stopping training…\n")
+
+        def finish():
+            try:
+                self._terminate_training_process(proc)
+                t = self.training_thread
+                self.training_thread = None
+                if t is not None:
+                    t.join(timeout=1)
+                self._console_from_thread("Training stopped\n")
+            finally:
+                self._stop_in_flight = False
+
+        if wait:
+            finish()
+        else:
+            threading.Thread(target=finish, daemon=True).start()
 
     # (save_settings/load_settings removed: 160 lines of dead code with no
     #  callers, duplicating the preset system with a 4-key save/load asymmetry.)

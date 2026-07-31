@@ -1415,6 +1415,20 @@ def train_krea2(
                         _sampler.n_shapes, _sampler.est_random_changes)
         except Exception as e:
             logger.warning("[dataloader] bucket ordering unavailable (%s) — using plain shuffle", e)
+    # num_workers=0 is deliberate, and was re-measured rather than inherited. __getitem__ does
+    # two load_file() calls (image_dataset.py), and the Krea 2 text cache is the big one — a
+    # 12-layer Qwen3-VL stack, 15.5 MB per sample — so moving it to worker processes looks like
+    # an obvious win. Measured on a 4090, 60 samples of exactly that shape:
+    #
+    #     simulated step   workers=0   workers=2   workers=4   gain
+    #     0.00 s (pure I/O)    0.34 s      0.46 s      0.48 s   -37%   workers are SLOWER
+    #     0.10 s               6.39 s      6.11 s      6.12 s   +4.5%
+    #
+    # safetensors mmaps, so a warm read is ~5.7 ms/sample — against Krea 2's ~0.7 s/it that is
+    # under 1% of step time, and it is entirely hidden at any realistic step. Workers have to
+    # ship those 15.5 MB per sample through shared memory, which is why they lose outright when
+    # there is no step to hide behind. Not worth the processes, the RAM, or Windows spawn cost.
+    # (A dataset far larger than RAM would read cold every epoch and could change this.)
     loader = DataLoader(group, batch_size=1, shuffle=(_sampler is None), sampler=_sampler,
                         collate_fn=collator, num_workers=0)
 

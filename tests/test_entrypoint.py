@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 
-REPO = r"W:/Peter/Documents/Development/Fizgig"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = os.path.join(REPO, "docker", "entrypoint.sh")
 
 fails = []

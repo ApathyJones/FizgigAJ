@@ -5,9 +5,10 @@ CPU, and running it per block meant a device sync in every one of the 28 blocks 
 checkpointing) plus a graph break for torch.compile. This checks the behaviour is unchanged:
 uniform sequence lengths trim, ragged ones do not, and split-attn never trims.
 """
+import os
 import sys
 
-sys.path.insert(0, r"W:\Peter\Documents\Development\Fizgig\src")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import torch
 
 from fizgig.krea2.attention import AttentionParams as K2Params, attention as k2_attention
@@ -67,8 +68,19 @@ with torch.no_grad():
     a = k2_attention(q, q, q, attn_params=rounded_p)
     b = k2_attention(q, q, q, attn_params=exact_p)
 n = exact_p.uniform_seqlen
-assert torch.equal(a[:, :n], b[:, :n]), "rounding must not change the valid tokens"
-print(f"  rounding: 1074 -> 1088 (masked slack), valid tokens bit-identical to the exact trim")
+# Bounded by one ULP, not torch.equal. The two calls attend over different sequence lengths
+# (1088 vs 1074), so SDPA is free to pick a different reduction order and the last bit can
+# land either way — that is rounding, not the masked slack leaking in. It happens to be
+# bit-identical on CUDA, which is why torch.equal passed there and failed the moment the suite
+# ran anywhere else. Measured on CPU: 184 of 613376 elements differ, every one by exactly
+# 1 ULP. A real leak would move values by orders of magnitude more than this bound allows.
+_x, _y = a[:, :n].float(), b[:, :n].float()
+_diff = (_x - _y).abs().max().item()
+_ulp = torch.finfo(a.dtype).eps * max(1.0, _y.abs().max().item())
+assert _diff <= _ulp, (
+    f"rounding must not change the valid tokens: max diff {_diff:.3e} > 1 ULP ({_ulp:.3e})")
+print(f"  rounding: 1074 -> 1088 (masked slack), valid tokens within 1 ULP of the exact trim "
+      f"(max diff {_diff:.2e})")
 
 # --- auto backend: cuDNN only once it pays for itself ------------------------------------------
 from fizgig.modules import sdpa  # noqa: E402
